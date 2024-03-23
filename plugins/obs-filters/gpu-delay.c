@@ -4,6 +4,8 @@
 
 #define S_DELAY_MS "delay_ms"
 #define T_DELAY_MS obs_module_text("DelayMs")
+#define S_FREEZE "freeze"
+#define T_FREEZE obs_module_text("Freeze")
 
 struct frame {
 	gs_texrender_t *render;
@@ -13,6 +15,7 @@ struct frame {
 
 struct gpu_delay_filter_data {
 	obs_source_t *context;
+	struct frame last_frame;
 	struct deque frames;
 	uint64_t delay_ns;
 	uint64_t interval_ns;
@@ -20,6 +23,7 @@ struct gpu_delay_filter_data {
 	uint32_t cy;
 	bool target_valid;
 	bool processed_frame;
+	bool frozen;
 };
 
 static const char *gpu_delay_filter_get_name(void *unused)
@@ -94,7 +98,7 @@ static inline void check_interval(struct gpu_delay_filter_data *f)
 
 	interval_ns = util_mul_div64(ovi.fps_den, 1000000000ULL, ovi.fps_num);
 
-	if (interval_ns != f->interval_ns)
+	if (interval_ns != f->interval_ns) //  && !f->frozen
 		update_interval(f, interval_ns);
 }
 
@@ -135,8 +139,15 @@ static inline bool check_size(struct gpu_delay_filter_data *f)
 static void gpu_delay_filter_update(void *data, obs_data_t *s)
 {
 	struct gpu_delay_filter_data *f = data;
+	uint64_t new_delay = (uint64_t)obs_data_get_int(s, S_DELAY_MS) * 1000000ULL;
 
-	f->delay_ns = (uint64_t)obs_data_get_int(s, S_DELAY_MS) * 1000000ULL;
+	f->frozen = (bool)obs_data_get_bool(s, S_FREEZE);
+
+	if (f->delay_ns == new_delay) {
+		return;
+	}
+
+	f->delay_ns = new_delay;
 
 	/* full reset */
 	f->cx = 0;
@@ -150,8 +161,10 @@ static obs_properties_t *gpu_delay_filter_properties(void *data)
 	obs_properties_t *props = obs_properties_create();
 
 	obs_property_t *p = obs_properties_add_int(props, S_DELAY_MS,
-						   T_DELAY_MS, 0, 500, 1);
+						   T_DELAY_MS, 0, 5000, 1);
 	obs_property_int_set_suffix(p, " ms");
+
+	obs_properties_add_bool(props, S_FREEZE, T_FREEZE);
 
 	UNUSED_PARAMETER(data);
 	return props;
@@ -239,16 +252,19 @@ get_tech_name_and_multiplier(enum gs_color_space current_space,
 
 static void draw_frame(struct gpu_delay_filter_data *f)
 {
-	struct frame frame;
-	deque_peek_front(&f->frames, &frame, sizeof(frame));
+	// struct frame frame;
+
+	if (!f->frozen) {
+		deque_peek_front(&f->frames, &f->last_frame, sizeof(struct frame));
+	}
 
 	const enum gs_color_space current_space = gs_get_color_space();
 	float multiplier;
 	const char *technique = get_tech_name_and_multiplier(
-		current_space, frame.space, &multiplier);
+		current_space, f->last_frame.space, &multiplier);
 
 	gs_effect_t *effect = obs_get_base_effect(OBS_EFFECT_DEFAULT);
-	gs_texture_t *tex = gs_texrender_get_texture(frame.render);
+	gs_texture_t *tex = gs_texrender_get_texture(f->last_frame.render);
 	if (tex) {
 		const bool previous = gs_framebuffer_srgb_enabled();
 		gs_enable_framebuffer_srgb(true);
@@ -284,6 +300,11 @@ static void gpu_delay_filter_render(void *data, gs_effect_t *effect)
 
 	struct frame frame;
 	deque_pop_front(&f->frames, &frame, sizeof(frame));
+
+	if (frame.render == f->last_frame.render && f->frozen) {
+		frame.render = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
+	}
+	
 
 	const enum gs_color_space preferred_spaces[] = {
 		GS_CS_SRGB,
